@@ -1,320 +1,841 @@
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime, timedelta
+import sqlite3
 import asyncio
+import datetime
+import re
+from typing import List, Optional, Dict, Any
 import json
+import logging
 import os
 
-# Botの設定
+# ログ設定
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Bot設定
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='/', intents=intents)
+intents.members = True
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# タスクデータを保存する辞書（本来はDBを使用）
-tasks_db = {}
-task_counter = 1
+# 重複実行防止用のセット
+executing_commands = set()
 
-# リマインド頻度の選択肢
-REMIND_OPTIONS = {
-    '毎朝9:55': '09:55',
-    '毎朝10:00': '10:00',
-    '毎夕18:00': '18:00',
-    '毎日': 'daily',
-    '3日おき': '3days',
-    '毎週月曜': 'weekly_mon',
-    '毎週火曜': 'weekly_tue',
-    '毎週水曜': 'weekly_wed',
-    '毎週木曜': 'weekly_thu',
-    '毎週金曜': 'weekly_fri'
-}
+# リマインダー送信済みタスクを記録するセット（メモリ内）
+reminded_tasks = set()
 
-class TaskView(discord.ui.View):
-    def __init__(self, task_id):
-        super().__init__(timeout=None)
-        self.task_id = task_id
+# データベース初期化
+def init_database():
+    conn = sqlite3.connect('reminder_bot.db')
+    cursor = conn.cursor()
+    
+    # 管理者テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            guild_id INTEGER,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 指示権限者テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS instructors (
+            user_id INTEGER,
+            guild_id INTEGER,
+            target_users TEXT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, guild_id)
+        )
+    ''')
+    
+    # タスクテーブル（リマインダー送信フラグを追加）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            instructor_id INTEGER,
+            assignee_id INTEGER,
+            task_name TEXT,
+            due_date TIMESTAMP,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message_id INTEGER,
+            channel_id INTEGER,
+            reminder_sent INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # 通知チャンネルテーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            guild_id INTEGER,
+            user_id INTEGER,
+            channel_id INTEGER,
+            channel_type TEXT,
+            PRIMARY KEY (guild_id, user_id, channel_type)
+        )
+    ''')
+    
+    # 既存のテーブルにreminder_sentカラムを追加（存在しない場合）
+    try:
+        cursor.execute('ALTER TABLE tasks ADD COLUMN reminder_sent INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # カラムが既に存在する場合
+    
+    conn.commit()
+    conn.close()
+    logger.info("データベース初期化完了")
 
-    @discord.ui.button(label='完了', style=discord.ButtonStyle.green, emoji='✅')
-    async def complete_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.task_id in tasks_db:
-            tasks_db[self.task_id]['status'] = '完了'
-            tasks_db[self.task_id]['completed_at'] = datetime.now()
-            
-            # 完了通知
-            embed = discord.Embed(
-                title="タスク完了！",
-                description=f"タスク #{self.task_id} が完了しました",
-                color=0x00ff00
-            )
-            embed.add_field(name="タスク内容", value=tasks_db[self.task_id]['content'], inline=False)
-            embed.add_field(name="完了者", value=interaction.user.mention, inline=True)
-            embed.add_field(name="完了時刻", value=datetime.now().strftime('%Y-%m-%d %H:%M'), inline=True)
-            
-            await interaction.response.send_message(embed=embed)
-            
-            # 指示者に通知
-            if tasks_db[self.task_id]['assignee_id'] != interaction.user.id:
-                assignee = bot.get_user(tasks_db[self.task_id]['assignee_id'])
-                if assignee:
-                    await assignee.send(f"あなたが指示したタスク #{self.task_id} が完了しました！")
+# データベース操作関数
+class DatabaseManager:
+    @staticmethod
+    def execute_query(query: str, params: tuple = None):
+        conn = sqlite3.connect('reminder_bot.db')
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        result = cursor.fetchall()
+        conn.commit()
+        conn.close()
+        return result
+    
+    @staticmethod
+    def is_admin(user_id: int, guild_id: int) -> bool:
+        result = DatabaseManager.execute_query(
+            "SELECT 1 FROM admins WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        )
+        return len(result) > 0
+    
+    @staticmethod
+    def is_instructor(user_id: int, guild_id: int) -> bool:
+        result = DatabaseManager.execute_query(
+            "SELECT 1 FROM instructors WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        )
+        return len(result) > 0
+    
+    @staticmethod
+    def can_instruct_user(instructor_id: int, target_id: int, guild_id: int) -> bool:
+        if DatabaseManager.is_admin(instructor_id, guild_id):
+            return True
+        
+        result = DatabaseManager.execute_query(
+            "SELECT target_users FROM instructors WHERE user_id = ? AND guild_id = ?",
+            (instructor_id, guild_id)
+        )
+        
+        if not result:
+            return False
+        
+        target_users = json.loads(result[0][0]) if result[0][0] else []
+        return target_id in target_users or not target_users  # 空リストは全員対象
+    
+    @staticmethod
+    def add_task(guild_id: int, instructor_id: int, assignee_id: int, 
+                task_name: str, due_date: datetime.datetime, message_id: int, channel_id: int):
+        DatabaseManager.execute_query(
+            "INSERT INTO tasks (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, instructor_id, assignee_id, task_name, due_date, message_id, channel_id)
+        )
+    
+    @staticmethod
+    def update_task_status(task_id: int, status: str):
+        DatabaseManager.execute_query(
+            "UPDATE tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, task_id)
+        )
+    
+    @staticmethod
+    def check_duplicate_task(assignee_id: int, task_name: str, guild_id: int) -> bool:
+        result = DatabaseManager.execute_query(
+            "SELECT 1 FROM tasks WHERE assignee_id = ? AND task_name = ? AND guild_id = ? AND status NOT IN ('completed', 'abandoned', 'declined')",
+            (assignee_id, task_name, guild_id)
+        )
+        return len(result) > 0
 
-    @discord.ui.button(label='進行中', style=discord.ButtonStyle.primary, emoji='🔄')
-    async def in_progress(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.task_id in tasks_db:
-            tasks_db[self.task_id]['status'] = '進行中'
-            await interaction.response.send_message(f"タスク #{self.task_id} を進行中に更新しました", ephemeral=True)
+    @staticmethod
+    def add_instructor_if_not_exists(user_id: int, guild_id: int, target_users: list) -> bool:
+        """指示者が存在しない場合のみ追加し、追加されたかどうかを返す"""
+        # 既存チェック
+        existing = DatabaseManager.execute_query(
+            "SELECT 1 FROM instructors WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        )
+        
+        if existing:
+            return False  # 既に存在する
+        
+        # 新規追加
+        DatabaseManager.execute_query(
+            "INSERT INTO instructors (user_id, guild_id, target_users) VALUES (?, ?, ?)",
+            (user_id, guild_id, json.dumps(target_users))
+        )
+        return True  # 新規追加された
 
-    @discord.ui.button(label='未着手', style=discord.ButtonStyle.secondary, emoji='⏸️')
-    async def not_started(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.task_id in tasks_db:
-            tasks_db[self.task_id]['status'] = '未着手'
-            await interaction.response.send_message(f"タスク #{self.task_id} を未着手に更新しました", ephemeral=True)
+    @staticmethod
+    def add_admin_if_not_exists(user_id: int, guild_id: int) -> bool:
+        """管理者が存在しない場合のみ追加し、追加されたかどうかを返す"""
+        # 既存チェック
+        existing = DatabaseManager.execute_query(
+            "SELECT 1 FROM admins WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id)
+        )
+        
+        if existing:
+            return False  # 既に存在する
+        
+        # 新規追加
+        DatabaseManager.execute_query(
+            "INSERT INTO admins (user_id, guild_id) VALUES (?, ?)",
+            (user_id, guild_id)
+        )
+        return True  # 新規追加された
 
+    @staticmethod
+    def mark_reminder_sent(task_id: int):
+        """リマインダー送信フラグを設定"""
+        DatabaseManager.execute_query(
+            "UPDATE tasks SET reminder_sent = 1 WHERE id = ?",
+            (task_id,)
+        )
+
+# 日付解析関数（時間指定対応版）
+def parse_date(date_str: str) -> Optional[datetime.datetime]:
+    now = datetime.datetime.now()
+    
+    # 時間部分を分離
+    time_part = None
+    date_part = date_str.strip()
+    
+    # 時間指定がある場合（HH:MM形式）
+    time_match = re.search(r'(\d{1,2}):(\d{2})$', date_str)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+        
+        # 時間の妥当性チェック
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            time_part = (hour, minute)
+            date_part = date_str[:time_match.start()].strip()
+        else:
+            return None
+    
+    # デフォルト時間（時間指定がない場合）
+    default_hour = 23
+    default_minute = 59
+    
+    # 相対指定
+    if date_part == "今日":
+        base_date = now
+    elif date_part == "明日":
+        base_date = now + datetime.timedelta(days=1)
+    elif "日後" in date_part:
+        try:
+            days = int(date_part.replace("日後", ""))
+            base_date = now + datetime.timedelta(days=days)
+        except ValueError:
+            return None
+    elif "週間後" in date_part:
+        try:
+            weeks = int(date_part.replace("週間後", ""))
+            base_date = now + datetime.timedelta(weeks=weeks)
+        except ValueError:
+            return None
+    else:
+        # 絶対指定
+        base_date = None
+        date_patterns = [
+            (r'(\d{1,2})/(\d{1,2})', "%m/%d"),
+            (r'(\d{4})/(\d{1,2})/(\d{1,2})', "%Y/%m/%d"),
+        ]
+        
+        for pattern, format_str in date_patterns:
+            match = re.match(pattern, date_part)
+            if match:
+                try:
+                    if len(match.groups()) == 2:
+                        base_date = datetime.datetime.strptime(f"{now.year}/{date_part}", "%Y/%m/%d")
+                        if base_date < now.replace(hour=0, minute=0, second=0, microsecond=0):
+                            base_date = base_date.replace(year=now.year + 1)
+                    else:
+                        base_date = datetime.datetime.strptime(date_part, format_str)
+                    break
+                except ValueError:
+                    continue
+        
+        if base_date is None:
+            return None
+    
+    # 時間を設定
+    if time_part:
+        hour, minute = time_part
+        result_date = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    else:
+        # 時間指定がない場合は23:59
+        result_date = base_date.replace(hour=default_hour, minute=default_minute, second=0, microsecond=0)
+    
+    return result_date
+
+# Botイベント
 @bot.event
 async def on_ready():
-    print(f'{bot.user} がログインしました！')
-    reminder_loop.start()  # リマインダーループを開始
-
-@bot.command(name='task')
-async def create_task(ctx, member: discord.Member, deadline: str, remind_freq: str = '毎朝9:55', *, content: str):
-    """
-    タスクを作成するコマンド
-    使用例: /task @ユーザー 2025-07-30_17:00 毎朝9:55 レポート作成をお願いします
-    """
-    global task_counter
+    logger.info(f'{bot.user} が起動しました！')
+    logger.info(f"Bot is in {len(bot.guilds)} guilds")
     
+    init_database()
+    
+    # 各ギルドで管理者ロールを作成/更新
+    for guild in bot.guilds:
+        logger.info(f"Setting up guild: {guild.name} (ID: {guild.id})")
+        await setup_roles(guild)
+    
+    # 定期タスク開始
     try:
-        # 期日をパース
-        deadline_dt = datetime.strptime(deadline, '%Y-%m-%d_%H:%M')
-        
-        # タスクデータを作成
-        task_data = {
-            'id': task_counter,
-            'content': content,
-            'assignee_id': ctx.author.id,
-            'target_id': member.id,
-            'deadline': deadline_dt,
-            'remind_freq': remind_freq,
-            'status': '未着手',
-            'created_at': datetime.now(),
-            'channel_id': ctx.channel.id
-        }
-        
-        tasks_db[task_counter] = task_data
-        
-        # タスク表示用embed
-        embed = discord.Embed(
-            title=f"新しいタスク #{task_counter}",
-            description=content,
-            color=0x3498db
-        )
-        embed.add_field(name="担当者", value=member.mention, inline=True)
-        embed.add_field(name="締切", value=deadline_dt.strftime('%Y年%m月%d日 %H:%M'), inline=True)
-        embed.add_field(name="リマインド", value=remind_freq, inline=True)
-        embed.add_field(name="状態", value="未着手", inline=True)
-        embed.set_footer(text=f"指示者: {ctx.author.display_name}")
-        
-        # ボタン付きでメッセージ送信
-        view = TaskView(task_counter)
-        await ctx.send(embed=embed, view=view)
-        
-        # 担当者にDM送信
-        try:
-            await member.send(f"新しいタスクが割り当てられました！\n**内容**: {content}\n**締切**: {deadline_dt.strftime('%Y年%m月%d日 %H:%M')}")
-        except:
-            await ctx.send(f"{member.mention} にDMを送信できませんでした。")
-        
-        task_counter += 1
-        
-    except ValueError:
-        await ctx.send("期日の形式が正しくありません。YYYY-MM-DD_HH:MM の形式で入力してください。\n例: 2025-07-30_17:00")
+        if not check_reminders.is_running():
+            check_reminders.start()
+            logger.info("Reminder task started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start reminder task: {e}")
 
-@bot.command(name='deadline_change')
-async def change_deadline(ctx, task_id: int, new_deadline: str):
-    """
-    タスクの期日を変更するコマンド
-    使用例: /deadline_change 123 2025-07-30_17:00
-    """
-    if task_id not in tasks_db:
-        await ctx.send(f"タスク #{task_id} が見つかりません。")
+async def setup_roles(guild):
+    """ロールの作成と管理"""
+    # タスク管理者ロール
+    admin_role = discord.utils.get(guild.roles, name="タスク管理者")
+    if not admin_role:
+        admin_role = await guild.create_role(
+            name="タスク管理者",
+            color=discord.Color.red(),
+            hoist=True
+        )
+    
+    # タスク指示者ロール
+    instructor_role = discord.utils.get(guild.roles, name="タスク指示者")
+    if not instructor_role:
+        instructor_role = await guild.create_role(
+            name="タスク指示者",
+            color=discord.Color.blue(),
+            hoist=True
+        )
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if message.author.bot:
         return
     
+    # デバッグログ
+    logger.info(f"Message received: {message.content[:50]}... from {message.author.display_name}")
+    logger.info(f"Bot user: {bot.user}")
+    logger.info(f"Bot user ID: {bot.user.id}")
+    logger.info(f"Mentions: {message.mentions}")
+    logger.info(f"All mentions (raw): {message.raw_mentions}")
+    logger.info(f"Bot in mentions: {bot.user in message.mentions}")
+    logger.info(f"Bot ID in raw mentions: {bot.user.id in message.raw_mentions}")
+    
+    # Bot宛のメンション処理（強化版）
+    bot_mentioned = False
+    
+    # 方法1: メンションリストでチェック
+    if bot.user in message.mentions:
+        bot_mentioned = True
+        logger.info("Bot mentioned via mentions list")
+    
+    # 方法2: raw_mentionsでチェック
+    elif bot.user.id in message.raw_mentions:
+        bot_mentioned = True
+        logger.info("Bot mentioned via raw_mentions")
+    
+    # 方法3: メッセージ内容でチェック（より詳細）
+    elif (f"<@{bot.user.id}>" in message.content or 
+          f"<@!{bot.user.id}>" in message.content or
+          f"@{bot.user.name}" in message.content or
+          f"@{bot.user.display_name}" in message.content):
+        bot_mentioned = True
+        logger.info("Bot mentioned via content check")
+    
+    # 方法4: メッセージの最初の部分をチェック
+    elif message.content.strip().startswith(f"<@{bot.user.id}>") or message.content.strip().startswith(f"<@!{bot.user.id}>"):
+        bot_mentioned = True
+        logger.info("Bot mentioned at start of message")
+    
+    if bot_mentioned:
+        logger.info(f"Bot mentioned! Processing task instruction...")
+        await handle_task_instruction(message)
+    
+    await bot.process_commands(message)  # ←これが必須！
+
+async def handle_task_instruction(message):
+    """タスク指示の処理"""
+    logger.info(f"Starting task instruction processing...")
+    content = message.content
+    guild = message.guild
+    instructor = message.author
+    
+    # 権限チェック
+    if not (DatabaseManager.is_admin(instructor.id, guild.id) or 
+            DatabaseManager.is_instructor(instructor.id, guild.id)):
+        await message.reply("❌ 指示権限がありません。管理者にお問い合わせください。")
+        return
+    
+    # メンション解析
+    mentions = message.mentions[1:]  # 最初のメンションはBot自身
+    if not mentions:
+        await message.reply("❌ 指示対象のユーザーをメンションしてください。")
+        return
+    
+    if len(mentions) > 10:
+        await message.reply("❌ 一度に指示できるのは最大10人までです。")
+        return
+    
+    # コンテンツから期日とタスク名を抽出
+    # 形式: @bot @user1 @user2, 期日, タスク名
+    content_parts = content.split(',')
+    if len(content_parts) < 3:
+        await message.reply("❌ 形式が正しくありません。形式: `@bot @ユーザー, 期日, タスク名`")
+        return
+    
+    date_str = content_parts[1].strip()
+    task_name = content_parts[2].strip()
+    
+    if len(task_name) > 100:
+        await message.reply("❌ タスク名は100文字以内で入力してください。")
+        return
+    
+    # 期日解析
+    due_date = parse_date(date_str)
+    if not due_date:
+        await message.reply("❌ 期日は『明日』『12/25』『3日後』の形式で入力してください。")
+        return
+    
+    # 各ユーザーにタスクを作成
+    success_count = 0
+    error_messages = []
+    
+    for user in mentions:
+        # 権限チェック
+        if not DatabaseManager.can_instruct_user(instructor.id, user.id, guild.id):
+            error_messages.append(f"❌ {user.display_name}への指示権限がありません。")
+            continue
+        
+        # 重複チェック
+        if DatabaseManager.check_duplicate_task(user.id, task_name, guild.id):
+            error_messages.append(f"❌ {user.display_name}には既に『{task_name}』タスクが指示済みです。")
+            continue
+        
+        # タスク作成
+        try:
+            # タスクをデータベースに追加
+            DatabaseManager.add_task(
+                guild.id, instructor.id, user.id, 
+                task_name, due_date, message.id, message.channel.id
+            )
+            
+            success_count += 1
+        except Exception as e:
+            error_messages.append(f"❌ {user.display_name}: エラーが発生しました。")
+            logger.error(f"Task creation error for {user.id}: {e}")
+    
+    # 結果報告
+    result_message = f"✅ {success_count}件のタスクを指示しました。"
+    if error_messages:
+        result_message += "\n\n⚠️ エラー:\n" + "\n".join(error_messages)
+    
+    await message.reply(result_message)
+
+# 管理者コマンド
+@bot.command(name='セットアップ', aliases=['setup'])
+@commands.has_permissions(administrator=True)
+async def setup_command(ctx):
+    """初期セットアップ"""
+    # 重複実行防止
+    command_key = f"setup_{ctx.author.id}_{ctx.guild.id}"
+    if command_key in executing_commands:
+        logger.info(f"Duplicate setup command ignored for {ctx.author.id}")
+        return
+    
+    executing_commands.add(command_key)
+    
     try:
-        new_deadline_dt = datetime.strptime(new_deadline, '%Y-%m-%d_%H:%M')
-        old_deadline = tasks_db[task_id]['deadline']
+        guild = ctx.guild
+        author = ctx.author
         
-        # 権限チェック（指示者または担当者のみ変更可能）
-        if ctx.author.id not in [tasks_db[task_id]['assignee_id'], tasks_db[task_id]['target_id']]:
-            await ctx.send("このタスクの期日を変更する権限がありません。")
-            return
+        # 管理者として登録（既存チェック付き）
+        was_added = DatabaseManager.add_admin_if_not_exists(author.id, guild.id)
         
-        tasks_db[task_id]['deadline'] = new_deadline_dt
+        # ロール作成
+        await setup_roles(guild)
+        
+        # 管理者ロールを付与
+        admin_role = discord.utils.get(guild.roles, name="タスク管理者")
+        if admin_role and admin_role not in author.roles:
+            await author.add_roles(admin_role)
         
         embed = discord.Embed(
-            title=f"タスク #{task_id} の期日を変更しました",
-            color=0xf39c12
+            title="✅ セットアップ完了",
+            description="リマインダーBotの初期設定が完了しました。",
+            color=discord.Color.green()
         )
-        embed.add_field(name="タスク内容", value=tasks_db[task_id]['content'], inline=False)
-        embed.add_field(name="変更前", value=old_deadline.strftime('%Y年%m月%d日 %H:%M'), inline=True)
-        embed.add_field(name="変更後", value=new_deadline_dt.strftime('%Y年%m月%d日 %H:%M'), inline=True)
-        embed.set_footer(text=f"変更者: {ctx.author.display_name}")
+        
+        if was_added:
+            embed.add_field(
+                name="管理者権限",
+                value=f"{author.display_name}を管理者に登録しました。",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="管理者権限",
+                value=f"{author.display_name}は既に管理者です。",
+                inline=False
+            )
+        
+        embed.add_field(
+            name="次のステップ",
+            value="1. `!指示者 追加 @ユーザー` で指示権限を付与\n2. `@bot @ユーザー, 期日, タスク名` でタスク指示",
+            inline=False
+        )
         
         await ctx.send(embed=embed)
         
-        # 関係者に通知
-        assignee = bot.get_user(tasks_db[task_id]['assignee_id'])
-        target = bot.get_user(tasks_db[task_id]['target_id'])
-        
-        for user in [assignee, target]:
-            if user and user.id != ctx.author.id:
-                try:
-                    await user.send(f"タスク #{task_id} の期日が変更されました。\n新しい締切: {new_deadline_dt.strftime('%Y年%m月%d日 %H:%M')}")
-                except:
-                    pass
-        
-    except ValueError:
-        await ctx.send("期日の形式が正しくありません。YYYY-MM-DD_HH:MM の形式で入力してください。")
+    finally:
+        executing_commands.discard(command_key)
 
-@bot.command(name='task_list')
-async def list_tasks(ctx):
-    """現在のタスク一覧を表示"""
-    if not tasks_db:
-        await ctx.send("現在登録されているタスクはありません。")
+@bot.command(name='管理者', aliases=['admin'])
+async def admin_command(ctx, action: str, user: discord.Member):
+    """管理者権限管理"""
+    # 重複実行防止
+    command_key = f"admin_{ctx.author.id}_{user.id}_{ctx.guild.id}_{action}"
+    if command_key in executing_commands:
+        logger.info(f"Duplicate admin command ignored for {ctx.author.id}")
         return
     
-    embed = discord.Embed(title="タスク一覧", color=0x2ecc71)
+    executing_commands.add(command_key)
     
-    for task_id, task in tasks_db.items():
-        if task['status'] != '完了':
-            assignee = bot.get_user(task['assignee_id'])
-            target = bot.get_user(task['target_id'])
+    try:
+        if not DatabaseManager.is_admin(ctx.author.id, ctx.guild.id):
+            await ctx.send("❌ 管理者権限が必要です。")
+            return
+        
+        if action == "追加" or action == "add":
+            was_added = DatabaseManager.add_admin_if_not_exists(user.id, ctx.guild.id)
             
-            status_emoji = {'未着手': '⏸️', '進行中': '🔄', '完了': '✅'}
+            if was_added:
+                admin_role = discord.utils.get(ctx.guild.roles, name="タスク管理者")
+                if admin_role and admin_role not in user.roles:
+                    try:
+                        await user.add_roles(admin_role)
+                        await ctx.send(f"✅ {user.display_name}を管理者に追加しました。")
+                    except discord.Forbidden:
+                        await ctx.send(f"⚠️ {user.display_name}を管理者に追加しましたが、ロールの付与に失敗しました。（Botの権限を確認してください）")
+                else:
+                    await ctx.send(f"✅ {user.display_name}を管理者に追加しました。")
+            else:
+                await ctx.send(f"ℹ️ {user.display_name}は既に管理者です。")
+        
+        elif action == "削除" or action == "remove":
+            # データベースから削除
+            DatabaseManager.execute_query(
+                "DELETE FROM admins WHERE user_id = ? AND guild_id = ?",
+                (user.id, ctx.guild.id)
+            )
+            
+            # Discordロールから削除（権限エラーをハンドリング）
+            admin_role = discord.utils.get(ctx.guild.roles, name="タスク管理者")
+            if admin_role and admin_role in user.roles:
+                try:
+                    await user.remove_roles(admin_role)
+                    await ctx.send(f"✅ {user.display_name}の管理者権限を完全に削除しました。")
+                    logger.info(f"管理者権限削除成功: {user.display_name} (ID: {user.id})")
+                except discord.Forbidden:
+                    await ctx.send(f"⚠️ {user.display_name}の管理者権限を削除しましたが、Discordロールの削除に失敗しました。\n"
+                                 f"**データベース**: ✅ 削除済み\n"
+                                 f"**Discordロール**: ❌ 権限不足\n"
+                                 f"**推奨**: Botのロール階層を確認してください。")
+                    logger.warning(f"管理者権限削除（ロール削除失敗）: {user.display_name} (ID: {user.id})")
+                except Exception as e:
+                    logger.error(f"ロール削除エラー: {e}")
+                    await ctx.send(f"⚠️ {user.display_name}の管理者権限を削除しましたが、ロール削除中にエラーが発生しました。\n"
+                                 f"**データベース**: ✅ 削除済み\n"
+                                 f"**Discordロール**: ❌ エラー発生\n"
+                                 f"**エラー**: {str(e)}")
+            else:
+                await ctx.send(f"✅ {user.display_name}の管理者権限を削除しました。\n"
+                             f"**データベース**: ✅ 削除済み\n"
+                             f"**Discordロール**: ✅ 既に削除済み")
+                logger.info(f"管理者権限削除（ロールなし）: {user.display_name} (ID: {user.id})")
+            
+    finally:
+        executing_commands.discard(command_key)
+
+@bot.command(name='指示者', aliases=['instructor'])
+async def instructor_command(ctx, action: str, user: discord.Member, *targets):
+    """指示権限管理"""
+    # 重複実行防止
+    command_key = f"instructor_{ctx.author.id}_{user.id}_{ctx.guild.id}_{action}"
+    if command_key in executing_commands:
+        logger.info(f"Duplicate instructor command ignored for {ctx.author.id}")
+        return
+    
+    executing_commands.add(command_key)
+    
+    try:
+        if not DatabaseManager.is_admin(ctx.author.id, ctx.guild.id):
+            await ctx.send("❌ 管理者権限が必要です。")
+            return
+        
+        if action == "追加" or action == "add":
+            target_ids = []
+            if targets:
+                for target in targets:
+                    if target.startswith('<@') and target.endswith('>'):
+                        target_id = int(target[2:-1].replace('!', ''))
+                        target_ids.append(target_id)
+            
+            was_added = DatabaseManager.add_instructor_if_not_exists(user.id, ctx.guild.id, target_ids)
+            
+            if was_added:
+                instructor_role = discord.utils.get(ctx.guild.roles, name="タスク指示者")
+                if instructor_role and instructor_role not in user.roles:
+                    await user.add_roles(instructor_role)
+                
+                target_desc = "全員" if not target_ids else f"{len(target_ids)}人のユーザー"
+                await ctx.send(f"✅ {user.display_name}に指示権限を付与しました。（対象: {target_desc}）")
+            else:
+                await ctx.send(f"ℹ️ {user.display_name}は既に指示者です。")
+        
+        elif action == "削除" or action == "remove":
+            # データベースから削除
+            DatabaseManager.execute_query(
+                "DELETE FROM instructors WHERE user_id = ? AND guild_id = ?",
+                (user.id, ctx.guild.id)
+            )
+            
+            # Discordロールから削除（権限エラーをハンドリング）
+            instructor_role = discord.utils.get(ctx.guild.roles, name="タスク指示者")
+            if instructor_role and instructor_role in user.roles:
+                try:
+                    await user.remove_roles(instructor_role)
+                    await ctx.send(f"✅ {user.display_name}の指示権限を完全に削除しました。")
+                    logger.info(f"指示権限削除成功: {user.display_name} (ID: {user.id})")
+                except discord.Forbidden:
+                    await ctx.send(f"⚠️ {user.display_name}の指示権限を削除しましたが、Discordロールの削除に失敗しました。\n"
+                                 f"**データベース**: ✅ 削除済み\n"
+                                 f"**Discordロール**: ❌ 権限不足\n"
+                                 f"**推奨**: Botのロール階層を確認してください。")
+                    logger.warning(f"指示権限削除（ロール削除失敗）: {user.display_name} (ID: {user.id})")
+                except Exception as e:
+                    logger.error(f"ロール削除エラー: {e}")
+                    await ctx.send(f"⚠️ {user.display_name}の指示権限を削除しましたが、ロール削除中にエラーが発生しました。\n"
+                                 f"**データベース**: ✅ 削除済み\n"
+                                 f"**Discordロール**: ❌ エラー発生\n"
+                                 f"**エラー**: {str(e)}")
+            else:
+                await ctx.send(f"✅ {user.display_name}の指示権限を削除しました。\n"
+                             f"**データベース**: ✅ 削除済み\n"
+                             f"**Discordロール**: ✅ 既に削除済み")
+                logger.info(f"指示権限削除（ロールなし）: {user.display_name} (ID: {user.id})")
+            
+    finally:
+        executing_commands.discard(command_key)
+
+@bot.command(name='タスク一覧', aliases=['tasks'])
+async def tasks_command(ctx, scope: str = ""):
+    """タスク一覧表示"""
+    user_id = ctx.author.id
+    guild_id = ctx.guild.id
+    
+    if scope == "全て" or scope == "all":
+        if not (DatabaseManager.is_admin(user_id, guild_id) or DatabaseManager.is_instructor(user_id, guild_id)):
+            await ctx.send("❌ 全体表示には権限が必要です。")
+            return
+        query = "SELECT * FROM tasks WHERE guild_id = ? ORDER BY due_date"
+        params = (guild_id,)
+    else:
+        query = "SELECT * FROM tasks WHERE guild_id = ? AND (instructor_id = ? OR assignee_id = ?) ORDER BY due_date"
+        params = (guild_id, user_id, user_id)
+    
+    tasks = DatabaseManager.execute_query(query, params)
+    
+    if not tasks:
+        await ctx.send("📝 該当するタスクはありません。")
+        return
+    
+    # ページング処理（10件ずつ）
+    page_size = 10
+    pages = [tasks[i:i + page_size] for i in range(0, len(tasks), page_size)]
+    
+    for i, page in enumerate(pages):
+        embed = discord.Embed(
+            title=f"📋 タスク一覧 (ページ {i+1}/{len(pages)})",
+            color=discord.Color.blue()
+        )
+        
+        for task in page:
+            # データベースの列数に対応
+            if len(task) >= 10:
+                task_id, guild_id, instructor_id, assignee_id, task_name, due_date, status, created_at, updated_at, message_id = task[:10]
+            else:
+                task_id, guild_id, instructor_id, assignee_id, task_name, due_date, status, created_at, updated_at = task[:9]
+            
+            instructor = ctx.guild.get_member(instructor_id)
+            assignee = ctx.guild.get_member(assignee_id)
+            
+            status_emoji = {
+                'pending': '⏳',
+                'accepted': '✅',
+                'completed': '🎉',
+                'declined': '❌',
+                'abandoned': '⚠️'
+            }
             
             embed.add_field(
-                name=f"#{task_id} {status_emoji.get(task['status'], '❓')} {task['status']}",
-                value=f"**内容**: {task['content']}\n**担当**: {target.display_name if target else 'Unknown'}\n**締切**: {task['deadline'].strftime('%m/%d %H:%M')}",
-                inline=False
+                name=f"{status_emoji.get(status, '❓')} {task_name}",
+                value=f"担当: {assignee.display_name if assignee else 'Unknown'}\n"
+                      f"指示者: {instructor.display_name if instructor else 'Unknown'}\n"
+                      f"期日: {due_date}\n"
+                      f"状態: {status}",
+                inline=True
             )
     
     await ctx.send(embed=embed)
 
-@tasks.loop(minutes=5)  # 5分ごとにチェック
-async def reminder_loop():
-    """リマインダーをチェックして送信"""
-    now = datetime.now()
-    current_time = now.strftime('%H:%M')
-    current_weekday = now.weekday()  # 0=月曜, 6=日曜
-    
-    for task_id, task in tasks_db.items():
-        if task['status'] == '完了':
-            continue
-            
-        remind_freq = task['remind_freq']
-        should_remind = False
-        
-        # 時刻指定のリマインド（毎朝9:55、毎朝10:00、毎夕18:00など）
-        if remind_freq.startswith('毎朝') or remind_freq.startswith('毎夕'):
-            if '9:55' in remind_freq and current_time == '09:55':
-                should_remind = True
-            elif '10:00' in remind_freq and current_time == '10:00':
-                should_remind = True
-            elif '18:00' in remind_freq and current_time == '18:00':
-                should_remind = True
-        
-        # 毎日（朝9時に送信）
-        elif remind_freq == '毎日' and current_time == '09:00':
-            should_remind = True
-        
-        # N日おき
-        elif remind_freq.endswith('日おき'):
-            try:
-                days_interval = int(remind_freq.replace('日おき', ''))
-                last_reminded = task.get('last_reminded')
-                
-                if last_reminded is None:
-                    # 初回は即座にリマインド
-                    should_remind = True
-                else:
-                    # 指定日数経過したかチェック
-                    days_since_last = (now - last_reminded).days
-                    if days_since_last >= days_interval and current_time == '09:00':
-                        should_remind = True
-            except:
-                pass
-        
-        # 毎週○曜日
-        elif remind_freq.startswith('毎週'):
-            weekday_map = {
-                '毎週月曜': 0, '毎週火曜': 1, '毎週水曜': 2, 
-                '毎週木曜': 3, '毎週金曜': 4, '毎週土曜': 5, '毎週日曜': 6
-            }
-            
-            if remind_freq in weekday_map:
-                target_weekday = weekday_map[remind_freq]
-                if current_weekday == target_weekday and current_time == '09:00':
-                    should_remind = True
-        
-        # リマインド送信
-        if should_remind:
-            await send_reminder(task_id, task)
-            # 最後にリマインドした時刻を更新
-            tasks_db[task_id]['last_reminded'] = now
-        
-        # 期日直前のリマインド（1日前、1時間前）
-        time_until_deadline = task['deadline'] - now
-        
-        if timedelta(hours=23, minutes=55) <= time_until_deadline <= timedelta(hours=24, minutes=5):
-            await send_reminder(task_id, task, "⚠️ 期日まで24時間を切りました！")
-        elif timedelta(minutes=55) <= time_until_deadline <= timedelta(hours=1, minutes=5):
-            await send_reminder(task_id, task, "🚨 期日まで1時間を切りました！")
-
-async def send_reminder(task_id, task, extra_message=""):
-    """リマインダーを個人用チャンネルに送信"""
-    target = bot.get_user(task['target_id'])
-    if not target:
+@bot.command(name='ヘルプ', aliases=['manual', 'h'])
+async def help_command(ctx):
+    """ヘルプ表示"""
+    # 重複実行防止
+    command_key = f"help_{ctx.author.id}_{ctx.guild.id}"
+    if command_key in executing_commands:
+        logger.info(f"Duplicate help command ignored for {ctx.author.id}")
         return
     
-    embed = discord.Embed(
-        title=f"📋 タスクリマインダー #{task_id}",
-        description=extra_message,
-        color=0xe74c3c if extra_message else 0x3498db
-    )
-    embed.add_field(name="タスク内容", value=task['content'], inline=False)
-    embed.add_field(name="締切", value=task['deadline'].strftime('%Y年%m月%d日 %H:%M'), inline=True)
-    embed.add_field(name="現在の状態", value=task['status'], inline=True)
+    executing_commands.add(command_key)
     
-    # 個人用チャンネルを探す（例：ユーザー名-personal のような命名規則）
-    personal_channel = None
-    
-    # サーバー内のチャンネルを検索
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            # 個人用チャンネルの命名パターンを確認
-            if (channel.name == f"{target.display_name.lower()}-personal" or 
-                channel.name == f"personal-{target.display_name.lower()}" or
-                f"{target.display_name.lower()}" in channel.name and "personal" in channel.name):
-                personal_channel = channel
-                break
-        if personal_channel:
-            break
-    
-    # 個人用チャンネルが見つかった場合はそこに送信
-    if personal_channel:
-        try:
-            await personal_channel.send(embed=embed)
-            return
-        except:
-            pass
-    
-    # 個人用チャンネルが見つからない場合はDMに送信
     try:
-        await target.send(embed=embed)
-    except:
-        # DMも送信できない場合は元のチャンネルに送信
-        channel = bot.get_channel(task['channel_id'])
-        if channel:
-            await channel.send(f"{target.mention} 個人用チャンネルが見つからないため、こちらに送信します。", embed=embed)
+        embed = discord.Embed(
+            title="🤖 リマインダーBot ヘルプ",
+            description="Discord リマインダーBot の使用方法",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="📝 タスク指示",
+            value="`@bot @ユーザー, 期日, タスク名`\n例: `@bot @田中, 明日, 資料作成`",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📋 コマンド一覧",
+            value="`!タスク一覧` - 自分のタスク表示\n"
+                  "`!タスク一覧 全て` - 全タスク表示（権限者）\n"
+                  "`!セットアップ` - 初期設定（管理者）\n"
+                  "`!管理者 追加/削除 @ユーザー` - 管理者管理\n"
+                  "`!指示者 追加/削除 @ユーザー` - 指示権限付与",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📅 期日指定",
+            value="今日、明日、3日後、1週間後\n12/25、2024/12/25\n時間指定: 明日 14:30",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔧 管理機能",
+            value="- 重複チェック機能\n- 権限制御\n- 自動リマインダー（期日1時間前・1回のみ）\n- データベース管理\n- ロール管理",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    finally:
+        executing_commands.discard(command_key)
 
-# Botを起動（実際の使用時はトークンを設定）
+# エラーハンドラー
+@bot.event
+async def on_command_error(ctx, error):
+    """コマンドエラーの処理"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # コマンドが見つからない場合は無視
+    
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ このコマンドを実行する権限がありません。")
+    
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ 指定されたユーザーが見つかりません。")
+    
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ コマンドの引数が正しくありません。`!ヘルプ`で使用方法を確認してください。")
+    
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send("❌ コマンドの実行中にエラーが発生しました。")
+
+# 定期リマインダーチェック（修正版）
+@tasks.loop(minutes=5)
+async def check_reminders():
+    """定期的にリマインダーをチェック（1回のみ送信）"""
+    now = datetime.datetime.now()
+    
+    # 期日1時間前のリマインダー（未送信のもののみ）
+    one_hour_later = now + datetime.timedelta(hours=1)
+    upcoming_tasks = DatabaseManager.execute_query(
+        "SELECT id, guild_id, instructor_id, assignee_id, task_name, due_date FROM tasks WHERE status = 'accepted' AND due_date BETWEEN ? AND ? AND due_date > ? AND reminder_sent = 0",
+        (now, one_hour_later, now)
+    )
+    
+    for task in upcoming_tasks:
+        task_id, guild_id, instructor_id, assignee_id, task_name, due_date = task
+        
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        
+        assignee = guild.get_member(assignee_id)
+        if not assignee:
+            continue
+        
+        try:
+            embed = discord.Embed(
+                title="⏰ タスク期日リマインダー",
+                description=f"『{task_name}』の期日が1時間以内に迫っています。",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="期日", value=due_date.strftime("%Y/%m/%d %H:%M"), inline=True)
+            embed.add_field(name="タスクID", value=f"#{task_id}", inline=True)
+            
+            # DMで送信
+            await assignee.send(embed=embed)
+            
+            # リマインダー送信済みフラグを設定
+            DatabaseManager.mark_reminder_sent(task_id)
+            logger.info(f"Reminder sent to {assignee.id} for task {task_id}")
+            
+        except discord.Forbidden:
+            logger.warning(f"Could not send reminder to {assignee.id}")
+            # 送信に失敗してもフラグは立てる（無限リトライを防ぐため）
+            DatabaseManager.mark_reminder_sent(task_id)
+        except Exception as e:
+            logger.error(f"Error sending reminder: {e}")
+
+# クリーンアップ処理
+@bot.event
+async def on_disconnect():
+    """Bot切断時の処理"""
+    logger.info("Bot disconnected, clearing executing commands")
+    executing_commands.clear()
+
+# Botトークンは環境変数から取得
 if __name__ == "__main__":
-    bot.run(os.environ['DISCORD_BOT_TOKEN'])
+    import os
+    TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    if not TOKEN:
+        logger.error("DISCORD_BOT_TOKEN environment variable not set")
+        exit(1)
+    bot.run(TOKEN)
