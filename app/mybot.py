@@ -861,18 +861,18 @@ async def send_notification_to_instructor(guild, instructor, message, assignee_i
 # 個人チャンネルにタスク通知を送信（修正版）
 async def send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id):
     """個人チャンネルにタスク通知を送信"""
-    channel_name = f"{assignee.display_name}のタスク"
+    channel_name = f"to-{assignee.display_name}"
     channel = discord.utils.get(guild.channels, name=channel_name)
     
     if not channel:
-        # チャンネルが無い場合は自動作成
+        # チャンネルが存在しない場合はDMで通知
         try:
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                assignee: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                discord.utils.get(guild.roles, name="タスク管理者"): discord.PermissionOverwrite(read_messages=True),
-                discord.utils.get(guild.roles, name="タスク指示者"): discord.PermissionOverwrite(read_messages=True)
-            }
+            channel = await assignee.create_dm()
+            await channel.send(f"❌ タスク通知用のチャンネル `{channel_name}` が見つかりません。管理者にチャンネルの作成を依頼してください。")
+            return
+        except:
+            logger.error(f"Failed to send DM to {assignee.display_name}")
+            return
             
             channel = await guild.create_text_channel(
                 channel_name, 
@@ -1325,7 +1325,7 @@ async def create_channels_command(ctx):
         if member.bot:  # Botは除外
             continue
             
-        channel_name = f"{member.display_name}のタスク"
+        channel_name = f"to-{member.display_name}"
         existing_channel = discord.utils.get(guild.channels, name=channel_name)
         
         if not existing_channel:
@@ -1390,7 +1390,7 @@ async def create_personal_channel_command(ctx, user: discord.Member = None):
         return
     
     guild = ctx.guild
-    channel_name = f"{user.display_name}のタスク"
+    channel_name = f"to-{user.display_name}"
     existing_channel = discord.utils.get(guild.channels, name=channel_name)
     
     if existing_channel:
