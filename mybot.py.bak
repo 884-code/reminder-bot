@@ -858,53 +858,25 @@ async def send_notification_to_instructor(guild, instructor, message, assignee_i
     except Exception as e:
         logger.error(f"通知送信エラー: {e}")
 
-# チャンネル名を取得する関数
-def get_user_channel_name(member):
-    """ユーザーのチャンネル名を一貫性を持って取得"""
-    return f"to-{member.name}"  # display_nameではなくnameを使用
-
 # 個人チャンネルにタスク通知を送信（修正版）
 async def send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id):
-    """個人チャンネルにタスク通知を送信"""
-    channel_name = get_user_channel_name(assignee)
+    """タスク通知をDMおよび個人チャンネル（存在する場合）に送信"""
+    channel = None
+    
+    # 1. 既存の個人チャンネルを探す
+    channel_name = f"to-{assignee.display_name}"
     channel = discord.utils.get(guild.channels, name=channel_name)
     
+    # 個人チャンネルが存在しない場合はDMのみ使用する
     if not channel:
-        # チャンネルが存在しない場合はDMで通知
+        logger.info(f"Personal channel {channel_name} not found for {assignee.display_name}")
         try:
             channel = await assignee.create_dm()
-            await channel.send(f"❌ タスク通知用のチャンネル `{channel_name}` が見つかりません。管理者にチャンネルの作成を依頼してください。")
-            
-            # 指示者にも通知
-            try:
-                instructor_dm = await instructor.create_dm()
-                await instructor_dm.send(f"⚠️ {assignee.mention} へのタスク通知チャンネル `{channel_name}` が見つかりません。`!個人チャンネル作成 {assignee.mention}` で作成してください。")
-            except:
-                logger.error(f"Failed to send DM to instructor {instructor.display_name}")
-            
-            return
+            await channel.send("⚠️ 個人チャンネルが見つかりません。管理者に `!個人チャンネル作成` コマンドの実行を依頼してください。")
         except:
             logger.error(f"Failed to send DM to {assignee.display_name}")
-            return
-            
-            channel = await guild.create_text_channel(
-                channel_name, 
-                overwrites=overwrites,
-                topic=f"{assignee.display_name}の個人タスク管理チャンネル"
-            )
-            
-            # 初回作成時の説明メッセージ
-            welcome_embed = discord.Embed(
-                title="📋 個人タスクチャンネル",
-                description=f"こんにちは、{assignee.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
-                color=discord.Color.blue()
-            )
-            welcome_embed.add_field(
-                name="機能",
-                value="• タスク通知の受信\n• タスクの受託・完了報告\n• 進捗状況の確認",
-                inline=False
-            )
-            await channel.send(embed=welcome_embed)
+            # DMの送信に失敗した場合、タスク通知の送信を試みる
+            channel = None
             
         except Exception as e:
             logger.error(f"Failed to create personal channel for {assignee.id}: {e}")
@@ -1314,77 +1286,47 @@ async def instructor_command(ctx, action: str, user: discord.Member, *targets):
 
 @bot.command(name='チャンネル作成', aliases=['channel'])
 async def create_channels_command(ctx):
-    """通知チャンネル一括作成"""
+    """通知チャンネル作成（タスク管理チャンネルのみ）"""
     if not DatabaseManager.is_admin(ctx.author.id, ctx.guild.id):
         await ctx.send("❌ 管理者権限が必要です。")
         return
     
     guild = ctx.guild
-    created_channels = []
     
-    # タスク管理チャンネル
+    # タスク管理チャンネルのみ作成
     management_channel = discord.utils.get(guild.channels, name="タスク管理")
     if not management_channel:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            discord.utils.get(guild.roles, name="タスク管理者"): discord.PermissionOverwrite(read_messages=True),
-            discord.utils.get(guild.roles, name="タスク指示者"): discord.PermissionOverwrite(read_messages=True)
-        }
-        management_channel = await guild.create_text_channel("タスク管理", overwrites=overwrites)
-        created_channels.append("タスク管理")
-    
-    # 個人タスクチャンネルを全メンバーに作成
-    for member in guild.members:
-        if member.bot:  # Botは除外
-            continue
-            
-        channel_name = f"to-{member.display_name}"
-        existing_channel = discord.utils.get(guild.channels, name=channel_name)
-        
-        if not existing_channel:
-            # 権限設定：本人、管理者、指示者のみアクセス可能
+        try:
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
                 discord.utils.get(guild.roles, name="タスク管理者"): discord.PermissionOverwrite(read_messages=True),
                 discord.utils.get(guild.roles, name="タスク指示者"): discord.PermissionOverwrite(read_messages=True)
             }
+            management_channel = await guild.create_text_channel("タスク管理", overwrites=overwrites)
             
-            try:
-                new_channel = await guild.create_text_channel(
-                    channel_name, 
-                    overwrites=overwrites,
-                    topic=f"{member.display_name}の個人タスク管理チャンネル"
-                )
-                created_channels.append(channel_name)
-                
-                # 作成通知をチャンネルに送信
-                embed = discord.Embed(
-                    title="📋 個人タスクチャンネル",
-                    description=f"こんにちは、{member.display_name}さん！\nこのチャンネルでタスクの通知を受け取ります。",
-                    color=discord.Color.blue()
-                )
-                embed.add_field(
-                    name="機能",
-                    value="• タスク通知の受信\n• タスクの受託・完了報告\n• 進捗状況の確認",
-                    inline=False
-                )
-                await new_channel.send(embed=embed)
-                
-            except discord.Forbidden:
-                logger.warning(f"Permission denied creating channel for {member.display_name}")
-            except Exception as e:
-                logger.error(f"Error creating channel for {member.display_name}: {e}")
-    
-    result_message = f"✅ {len(created_channels)}個のチャンネルを作成しました。"
-    if created_channels:
-        result_message += f"\n作成されたチャンネル: {', '.join(created_channels[:5])}"
-        if len(created_channels) > 5:
-            result_message += f" ...他{len(created_channels)-5}個"
+            # 作成成功の通知とガイダンス
+            embed = discord.Embed(
+                title="✅ タスク管理チャンネルを作成しました",
+                description="個人タスクチャンネルは必要に応じて個別に作成してください。",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="個人チャンネルの作成方法",
+                value="`!個人チャンネル作成 @ユーザー` コマンドを使用してください。",
+                inline=False
+            )
+            await ctx.send(embed=embed)
+            
+            # 管理チャンネルにも案内を送信
+            await management_channel.send("✅ タスク管理チャンネルが作成されました。個人タスクチャンネルは `!個人チャンネル作成 @ユーザー` で必要な分だけ作成してください。")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ チャンネル作成権限がありません。")
+        except Exception as e:
+            logger.error(f"Error creating management channel: {e}")
+            await ctx.send("❌ チャンネル作成中にエラーが発生しました。")
     else:
-        result_message = "ℹ️ 作成する必要のあるチャンネルはありませんでした。"
-    
-    await ctx.send(result_message)
+        await ctx.send("ℹ️ タスク管理チャンネルは既に存在します。個人チャンネルは `!個人チャンネル作成 @ユーザー` で作成してください。")
 
 # 個人チャンネル単体作成コマンドを追加
 @bot.command(name='個人チャンネル作成', aliases=['create_personal'])
@@ -1703,7 +1645,14 @@ async def check_reminders():
     # 期日1時間前のリマインダー（未送信のもののみ）
     one_hour_later = now + datetime.timedelta(hours=1)
     upcoming_tasks = DatabaseManager.execute_query(
-        "SELECT id, guild_id, instructor_id, assignee_id, task_name, due_date FROM tasks WHERE status = 'accepted' AND due_date BETWEEN ? AND ? AND due_date > ? AND reminder_sent = 0",
+        """
+        SELECT id, guild_id, instructor_id, assignee_id, task_name, due_date 
+        FROM tasks 
+        WHERE status = 'accepted' 
+        AND due_date BETWEEN ? AND ? 
+        AND due_date > ? 
+        AND reminder_sent = 0
+        """,
         (now, one_hour_later, now)
     )
     
@@ -1712,39 +1661,61 @@ async def check_reminders():
         
         guild = bot.get_guild(guild_id)
         if not guild:
+            logger.warning(f"Guild {guild_id} not found for task {task_id}")
+            DatabaseManager.mark_reminder_sent(task_id)
             continue
         
         assignee = guild.get_member(assignee_id)
         if not assignee:
+            logger.warning(f"Assignee {assignee_id} not found in guild {guild_id}")
+            DatabaseManager.mark_reminder_sent(task_id)
             continue
         
         try:
+            # リマインダー用のEmbedを作成
             embed = discord.Embed(
-                title=f"⏰ {task_name}",
-                description=f"**期日: {due_date.strftime('%Y/%m/%d %H:%M')}**",
-                color=discord.Color.orange()
+                title="⏰ タスクリマインダー",
+                description=f"『{task_name}』の期限まであと1時間です",
+                color=discord.Color.orange(),
+                timestamp=datetime.datetime.now()
             )
+            embed.add_field(name="期限", value=due_date.strftime("%Y/%m/%d %H:%M"), inline=True)
+            embed.add_field(name="タスクID", value=f"#{task_id}", inline=True)
             
-            # 個人チャンネルに送信を試行
-            channel_name = f"{assignee.display_name}のタスク"
+            success = False
+            
+            # 1. 個人チャンネルがある場合、そこに送信
+            channel_name = f"to-{assignee.display_name}"
             channel = discord.utils.get(guild.channels, name=channel_name)
             
-            if channel:
-                await channel.send(f"{assignee.mention}", embed=embed)
-            else:
-                # 個人チャンネルがない場合はDMで送信
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(f"{assignee.mention}", embed=embed)
+                    success = True
+                    logger.info(f"Reminder sent to channel {channel_name} for task {task_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder to channel {channel_name}: {e}")
+            
+            # 2. 必ずDMにも送信
+            try:
                 await assignee.send(embed=embed)
+                success = True
+                logger.info(f"Reminder sent to DM for task {task_id}")
+            except discord.Forbidden:
+                logger.warning(f"Could not send reminder DM to {assignee.display_name}: DMs forbidden")
+            except Exception as e:
+                logger.error(f"Failed to send reminder DM for task {task_id}: {e}")
             
-            # リマインダー送信済みフラグを設定
+            # 送信試行完了後、成否に関わらずフラグを設定（重複送信を防ぐため）
             DatabaseManager.mark_reminder_sent(task_id)
-            logger.info(f"Reminder sent to {assignee.id} for task {task_id}")
             
-        except discord.Forbidden:
-            logger.warning(f"Could not send reminder to {assignee.id}")
-            # 送信に失敗してもフラグは立てる（無限リトライを防ぐため）
-            DatabaseManager.mark_reminder_sent(task_id)
+            if not success:
+                logger.warning(f"Failed to send any reminder for task {task_id}")
+                
         except Exception as e:
-            logger.error(f"Error sending reminder: {e}")
+            logger.error(f"Error in reminder process for task {task_id}: {e}")
+            # エラー時もフラグを設定して重複を防ぐ
+            DatabaseManager.mark_reminder_sent(task_id)
 
 # 接続管理
 @bot.event
