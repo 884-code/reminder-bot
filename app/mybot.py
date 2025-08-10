@@ -858,15 +858,10 @@ async def send_notification_to_instructor(guild, instructor, message, assignee_i
     except Exception as e:
         logger.error(f"通知送信エラー: {e}")
 
-# チャンネル名を取得する関数
-def get_user_channel_name(member):
-    """ユーザーのチャンネル名を一貫性を持って取得"""
-    return f"to-{member.name}"  # display_nameではなくnameを使用
-
 # 個人チャンネルにタスク通知を送信（修正版）
 async def send_task_notification(guild, assignee, instructor, task_name, due_date, original_message_id):
     """個人チャンネルにタスク通知を送信"""
-    channel_name = get_user_channel_name(assignee)
+    channel_name = f"to-{assignee.display_name}"
     channel = discord.utils.get(guild.channels, name=channel_name)
     
     if not channel:
@@ -874,14 +869,6 @@ async def send_task_notification(guild, assignee, instructor, task_name, due_dat
         try:
             channel = await assignee.create_dm()
             await channel.send(f"❌ タスク通知用のチャンネル `{channel_name}` が見つかりません。管理者にチャンネルの作成を依頼してください。")
-            
-            # 指示者にも通知
-            try:
-                instructor_dm = await instructor.create_dm()
-                await instructor_dm.send(f"⚠️ {assignee.mention} へのタスク通知チャンネル `{channel_name}` が見つかりません。`!個人チャンネル作成 {assignee.mention}` で作成してください。")
-            except:
-                logger.error(f"Failed to send DM to instructor {instructor.display_name}")
-            
             return
         except:
             logger.error(f"Failed to send DM to {assignee.display_name}")
